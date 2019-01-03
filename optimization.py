@@ -77,6 +77,8 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       zip(grads, tvars), global_step=global_step)
 
   new_global_step = global_step + 1
+  # name global_step so we can report it in training hook
+  new_global_step = tf.identity(new_global_step, name='step_update')
   train_op = tf.group(train_op, [global_step.assign(new_global_step)])
   return train_op
 
@@ -144,6 +146,8 @@ class AdamWeightDecayOptimizer(tf.train.Optimizer):
         update += self.weight_decay_rate * param
 
       update_with_lr = self.learning_rate * update
+      # name learning rate so we can report it in training hook
+      self.learning_rate = tf.identity(self.learning_rate, name='learning_rate')
 
       next_param = param - update_with_lr
 

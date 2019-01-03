@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import time
 import modeling
 import optimization
 import tensorflow as tf
@@ -79,6 +80,8 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
+flags.DEFINE_bool("report_loss", False, "Whether to report total loss during training.")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 tf.flags.DEFINE_string(
@@ -104,6 +107,34 @@ tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
+
+
+# report samples/sec, total loss and learning rate during training
+class _LogSessionRunHook(tf.train.SessionRunHook):
+  def __init__(self, global_batch_size, display_every=10):
+    self.global_batch_size = global_batch_size
+    self.display_every = display_every
+  def after_create_session(self, session, coord):
+    print('  Step samples/sec   Loss  Learning-rate')
+    self.elapsed_secs = 0.
+    self.count = 0
+  def before_run(self, run_context):
+    self.t0 = time.time()
+    return tf.train.SessionRunArgs(
+        fetches=['step_update:0', 'total_loss:0',
+                 'learning_rate:0'])
+  def after_run(self, run_context, run_values):
+    self.elapsed_secs += time.time() - self.t0
+    self.count += 1
+    global_step, total_loss, lr = run_values.results
+    print_step = global_step + 1 # One-based index for printing.
+    if print_step == 1 or print_step % self.display_every == 0:
+        dt = self.elapsed_secs / self.count
+        img_per_sec = self.global_batch_size / dt
+        print('%6i %11.1f %6.3f     %6.4e' %
+              (print_step, img_per_sec, total_loss, lr))
+        self.elapsed_secs = 0.
+        self.count = 0
 
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
@@ -146,6 +177,8 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
          bert_config, model.get_pooled_output(), next_sentence_labels)
 
     total_loss = masked_lm_loss + next_sentence_loss
+    # name total_loss so we can report it in training hook
+    total_loss = tf.identity(total_loss, name='total_loss')
 
     tvars = tf.trainable_variables()
 
@@ -435,7 +468,13 @@ def main(_):
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+          per_host_input_for_training=is_per_host),
+      # This variable controls how often estimator reports examples/sec.
+      # Default value is every 100 steps.
+      # When --report_loss is True, we set to very large value to prevent
+      # default info reporting from estimator.
+      # Ideally we should set it to None, but that does not work.
+      log_step_count_steps=10000 if FLAGS.report_loss else 100)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -445,6 +484,14 @@ def main(_):
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
+
+  training_hooks = None
+  if FLAGS.report_loss:
+    global_batch_size = FLAGS.train_batch_size
+    if training_hooks == None:
+      training_hooks = [_LogSessionRunHook(global_batch_size,100)]
+    else:
+      training_hooks.append(_LogSessionRunHook(global_batch_size,100))
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
@@ -463,7 +510,10 @@ def main(_):
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+    estimator.train(
+        input_fn=train_input_fn, 
+        hooks=training_hooks,
+        max_steps=FLAGS.num_train_steps)
 
   if FLAGS.do_eval:
     tf.logging.info("***** Running evaluation *****")
