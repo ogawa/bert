@@ -82,6 +82,8 @@ flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("report_loss", False, "Whether to report total loss during training.")
 
+flags.DEFINE_bool("horovod", False, "Whether to use horovod for multi-GPU runs.")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 tf.flags.DEFINE_string(
@@ -107,6 +109,25 @@ tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
+
+if FLAGS.use_tpu and not FLAGS.do_train:
+  if FLAGS.horovod:
+    if FLAGS.use_tpu:
+      print('WARNING! Use of Horovod for TPU not supported.')
+    elif not FLAGS.do_train:
+      print('INFO! Turning off Horovod for evaluation.')
+    FLAGS.horovod = False
+
+# controls whether we are using horovod or not
+# in order to use horovod, user has to opt in and horovod has to be installed
+do_hvd = False
+if FLAGS.horovod:
+  try:
+    import horovod.tensorflow as hvd
+    do_hvd = True
+  except ImportError:
+    do_hvd = False
+    print('WARNING! Horovod is not installed.')
 
 
 # report samples/sec, total loss and learning rate during training
@@ -208,7 +229,8 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu,
+          do_hvd=do_hvd)
 
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
@@ -400,6 +422,7 @@ def input_fn_builder(input_files,
               sloppy=is_training,
               cycle_length=cycle_length))
       d = d.shuffle(buffer_size=100)
+      if do_hvd: d = d.shard(hvd.size(), hvd.rank())
     else:
       d = tf.data.TFRecordDataset(input_files)
       # Since we evaluate for a fixed number of steps we don't want to encounter
@@ -442,6 +465,8 @@ def main(_):
   if not FLAGS.do_train and not FLAGS.do_eval:
     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
+  if do_hvd: hvd.init()
+
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
@@ -460,11 +485,14 @@ def main(_):
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
   is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+  config = tf.ConfigProto()
+  if do_hvd: config.gpu_options.visible_device_list = str(hvd.local_rank())
   run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps if not do_hvd or hvd.rank() == 0 else None,
+      session_config=config,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
@@ -479,19 +507,18 @@ def main(_):
   model_fn = model_fn_builder(
       bert_config=bert_config,
       init_checkpoint=FLAGS.init_checkpoint,
-      learning_rate=FLAGS.learning_rate,
+      learning_rate=FLAGS.learning_rate if not do_hvd else FLAGS.learning_rate*hvd.size(), 
       num_train_steps=FLAGS.num_train_steps,
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
 
-  training_hooks = None
-  if FLAGS.report_loss:
-    global_batch_size = FLAGS.train_batch_size
-    if training_hooks == None:
-      training_hooks = [_LogSessionRunHook(global_batch_size,100)]
-    else:
-      training_hooks.append(_LogSessionRunHook(global_batch_size,100))
+  training_hooks = []
+  if FLAGS.report_loss and (not do_hvd or hvd.rank() == 0):
+    global_batch_size = FLAGS.train_batch_size if not do_hvd else FLAGS.train_batch_size*hvd.size()
+    training_hooks.append(_LogSessionRunHook(global_batch_size,100))
+  if do_hvd:
+    training_hooks.append(hvd.BroadcastGlobalVariablesHook(0))
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
@@ -515,7 +542,7 @@ def main(_):
         hooks=training_hooks,
         max_steps=FLAGS.num_train_steps)
 
-  if FLAGS.do_eval:
+  if FLAGS.do_eval and (not do_hvd or hvd.rank() ==0):
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
