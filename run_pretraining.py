@@ -84,6 +84,8 @@ flags.DEFINE_bool("report_loss", False, "Whether to report total loss during tra
 
 flags.DEFINE_bool("horovod", False, "Whether to use horovod for multi-GPU runs.")
 
+flags.DEFINE_bool("use_fp16", False, "Whether to use fp32 or fp16 arithmetic on GPU.")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 tf.flags.DEFINE_string(
@@ -110,13 +112,17 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
-if FLAGS.use_tpu and not FLAGS.do_train:
-  if FLAGS.horovod:
-    if FLAGS.use_tpu:
-      print('WARNING! Use of Horovod for TPU not supported.')
-    elif not FLAGS.do_train:
-      print('INFO! Turning off Horovod for evaluation.')
+if FLAGS.horovod:
+  if FLAGS.use_tpu:
+    print('WARNING! Use of Horovod for TPU not supported.')
     FLAGS.horovod = False
+  elif not FLAGS.do_train:
+    print('INFO! Turning off Horovod for evaluation.')
+    FLAGS.horovod = False
+if FLAGS.use_fp16:
+  if FLAGS.use_tpu:
+    print('WARNING! --use_fp16 not supported for TPU.')
+    FLAGS.use_fp16 = False
 
 # controls whether we are using horovod or not
 # in order to use horovod, user has to opt in and horovod has to be installed
@@ -129,6 +135,15 @@ if FLAGS.horovod:
     do_hvd = False
     print('WARNING! Horovod is not installed.')
 
+if FLAGS.use_tpu:
+  compute_type = tf.float32
+  custom_getter = None
+else:
+  try:
+    from gpu_environment import compute_type,custom_getter
+  except ImportError:
+    compute_type = tf.float32
+    custom_getter = None
 
 # report samples/sec, total loss and learning rate during training
 class _LogSessionRunHook(tf.train.SessionRunHook):
@@ -186,7 +201,9 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         input_ids=input_ids,
         input_mask=input_mask,
         token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+        use_one_hot_embeddings=use_one_hot_embeddings,
+        custom_getter=custom_getter,
+	compute_type=compute_type)
 
     (masked_lm_loss,
      masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
@@ -297,7 +314,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
 
-  with tf.variable_scope("cls/predictions"):
+  with tf.variable_scope("cls/predictions", custom_getter=custom_getter):
     # We apply one more non-linear transformation before the output layer.
     # This matrix is not used after pre-training.
     with tf.variable_scope("transform"):
@@ -315,7 +332,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
         "output_bias",
         shape=[bert_config.vocab_size],
         initializer=tf.zeros_initializer())
-    logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
+    logits = tf.matmul(tf.cast(input_tensor,tf.float32), output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
 
@@ -342,7 +359,7 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
 
   # Simple binary classification. Note that 0 is "next sentence" and 1 is
   # "random sentence". This weight matrix is not used after pre-training.
-  with tf.variable_scope("cls/seq_relationship"):
+  with tf.variable_scope("cls/seq_relationship", custom_getter=custom_getter):
     output_weights = tf.get_variable(
         "output_weights",
         shape=[2, bert_config.hidden_size],
@@ -350,7 +367,7 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
     output_bias = tf.get_variable(
         "output_bias", shape=[2], initializer=tf.zeros_initializer())
 
-    logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
+    logits = tf.matmul(tf.cast(input_tensor,tf.float32), output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
@@ -408,6 +425,7 @@ def input_fn_builder(input_files,
     # For eval, we want no shuffling and parallel reading doesn't matter.
     if is_training:
       d = tf.data.Dataset.from_tensor_slices(tf.constant(input_files))
+      if do_hvd: d = d.shard(hvd.size(), hvd.rank())
       d = d.repeat()
       d = d.shuffle(buffer_size=len(input_files))
 
@@ -422,7 +440,6 @@ def input_fn_builder(input_files,
               sloppy=is_training,
               cycle_length=cycle_length))
       d = d.shuffle(buffer_size=100)
-      if do_hvd: d = d.shard(hvd.size(), hvd.rank())
     else:
       d = tf.data.TFRecordDataset(input_files)
       # Since we evaluate for a fixed number of steps we don't want to encounter

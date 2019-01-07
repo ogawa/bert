@@ -26,7 +26,6 @@ import re
 import six
 import tensorflow as tf
 
-
 class BertConfig(object):
   """Configuration for `BertModel`."""
 
@@ -134,7 +133,9 @@ class BertModel(object):
                input_mask=None,
                token_type_ids=None,
                use_one_hot_embeddings=True,
-               scope=None):
+               scope=None,
+	       custom_getter=None,
+	       compute_type=tf.float32):
     """Constructor for BertModel.
 
     Args:
@@ -149,6 +150,8 @@ class BertModel(object):
         it is must faster if this is True, on the CPU or GPU, it is faster if
         this is False.
       scope: (optional) variable scope. Defaults to "bert".
+      custom_getter: (optional) custom_getter for compute types other than float32.
+      compute_type: (optional) compute type for forward and back propagation.
 
     Raises:
       ValueError: The config is invalid or one of the input tensor shapes
@@ -169,7 +172,7 @@ class BertModel(object):
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
-    with tf.variable_scope(scope, default_name="bert"):
+    with tf.variable_scope(scope, default_name="bert", custom_getter=custom_getter):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
         (self.embedding_output, self.embedding_table) = embedding_lookup(
@@ -179,6 +182,9 @@ class BertModel(object):
             initializer_range=config.initializer_range,
             word_embedding_name="word_embeddings",
             use_one_hot_embeddings=use_one_hot_embeddings)
+
+        # conditionally convert inputs to fp16
+        self.embedding_output = tf.cast(self.embedding_output, compute_type)
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
@@ -192,14 +198,15 @@ class BertModel(object):
             position_embedding_name="position_embeddings",
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
-            dropout_prob=config.hidden_dropout_prob)
+            dropout_prob=config.hidden_dropout_prob,
+	    compute_type=compute_type)
 
       with tf.variable_scope("encoder"):
         # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
         # mask of shape [batch_size, seq_length, seq_length] which is used
         # for the attention scores.
         attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask)
+            input_ids, input_mask, compute_type=compute_type)
 
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
@@ -274,7 +281,7 @@ def gelu(input_tensor):
   Returns:
     `input_tensor` with the GELU activation applied.
   """
-  cdf = 0.5 * (1.0 + tf.erf(input_tensor / tf.sqrt(2.0)))
+  cdf = 0.5 * (1.0 + tf.erf(input_tensor / 1.414213562))
   return input_tensor * cdf
 
 
@@ -359,11 +366,20 @@ def dropout(input_tensor, dropout_prob):
   output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
   return output
 
-
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
-  return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+  if input_tensor.dtype == tf.float16:
+    try:
+      from fused_layer_norm import fused_layer_norm
+      return fused_layer_norm(
+          inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name,
+          use_fused_batch_norm=True)
+    except ImportError:
+      return tf.contrib.layers.layer_norm(
+          inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+  else:
+    return tf.contrib.layers.layer_norm(
+        inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
 
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
@@ -436,7 +452,8 @@ def embedding_postprocessor(input_tensor,
                             position_embedding_name="position_embeddings",
                             initializer_range=0.02,
                             max_position_embeddings=512,
-                            dropout_prob=0.1):
+                            dropout_prob=0.1,
+			    compute_type=tf.float32):
   """Performs various post-processing on a word embedding tensor.
 
   Args:
@@ -457,6 +474,7 @@ def embedding_postprocessor(input_tensor,
       used with this model. This can be longer than the sequence length of
       input_tensor, but cannot be shorter.
     dropout_prob: float. Dropout probability applied to the final output tensor.
+    compute_type: (optional) compute type for forward and back propagation.
 
   Returns:
     float tensor with same shape as `input_tensor`.
@@ -484,6 +502,7 @@ def embedding_postprocessor(input_tensor,
     flat_token_type_ids = tf.reshape(token_type_ids, [-1])
     one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
+    token_type_embeddings = tf.cast(token_type_embeddings, compute_type)
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings
@@ -515,6 +534,7 @@ def embedding_postprocessor(input_tensor,
       for _ in range(num_dims - 2):
         position_broadcast_shape.append(1)
       position_broadcast_shape.extend([seq_length, width])
+      position_embeddings = tf.cast(position_embeddings, compute_type)
       position_embeddings = tf.reshape(position_embeddings,
                                        position_broadcast_shape)
       output += position_embeddings
@@ -523,12 +543,13 @@ def embedding_postprocessor(input_tensor,
   return output
 
 
-def create_attention_mask_from_input_mask(from_tensor, to_mask):
+def create_attention_mask_from_input_mask(from_tensor, to_mask, compute_type=tf.float32):
   """Create 3D attention mask from a 2D tensor mask.
 
   Args:
     from_tensor: 2D or 3D Tensor of shape [batch_size, from_seq_length, ...].
     to_mask: int32 Tensor of shape [batch_size, to_seq_length].
+    compute_type: (optional) compute type for forward and back propagation.
 
   Returns:
     float Tensor of shape [batch_size, from_seq_length, to_seq_length].
@@ -541,7 +562,7 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   to_seq_length = to_shape[1]
 
   to_mask = tf.cast(
-      tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
+      tf.reshape(to_mask, [batch_size, 1, to_seq_length]), compute_type)
 
   # We don't assume that `from_tensor` is a mask (although it could be). We
   # don't actually care if we attend *from* padding tokens (only *to* padding)
@@ -549,7 +570,7 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   #
   # `broadcast_ones` = [batch_size, from_seq_length, 1]
   broadcast_ones = tf.ones(
-      shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+      shape=[batch_size, from_seq_length, 1], dtype=compute_type)
 
   # Here we broadcast along two dimensions to create the mask.
   mask = broadcast_ones * to_mask
@@ -711,7 +732,7 @@ def attention_layer(from_tensor,
     # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
     # masked positions, this operation will create a tensor which is 0.0 for
     # positions we want to attend and -10000.0 for masked positions.
-    adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
+    adder = (1.0 - attention_mask) * -10000.0
 
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
