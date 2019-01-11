@@ -885,14 +885,7 @@ tf_examples.part.08.tfrecord, here is how you run it:
 
 ```shell
 mpiexec --allow-run-as-root --bind-to socket -np 8 python run_pretraining.py \
-  --input_file=/tmp/tf_examples.par01.tfrecord, \
-               /tmp/tf_examples.par02.tfrecord, \
-               /tmp/tf_examples.par03.tfrecord, \
-               /tmp/tf_examples.par04.tfrecord, \
-               /tmp/tf_examples.par05.tfrecord, \
-               /tmp/tf_examples.par06.tfrecord, \
-               /tmp/tf_examples.par07.tfrecord, \
-               /tmp/tf_examples.par08.tfrecord \
+  --input_file=/tmp/tf_examples.part01.tfrecord,/tmp/tf_examples.part02.tfrecord,/tmp/tf_examples.part03.tfrecord,/tmp/tf_examples.part04.tfrecord,/tmp/tf_examples.part05.tfrecord,/tmp/tf_examples.part06.tfrecord,/tmp/tf_examples.part07.tfrecord,/tmp/tf_examples.part08.tfrecord \
   --output_dir=/tmp/pretraining_output \
   --do_train=True \
   --do_eval=True \
@@ -907,8 +900,26 @@ mpiexec --allow-run-as-root --bind-to socket -np 8 python run_pretraining.py \
   --horovod
 ```
 
-You can combine --report_loss, --use_fp16 and --horovod.
+You can combine --report_loss, --use_fp16 and --horovod:
 
+```shell
+mpiexec --allow-run-as-root --bind-to socket -np 8 python run_pretraining.py \
+  --input_file=/tmp/tf_examples.part01.tfrecord,/tmp/tf_examples.part02.tfrecord,/tmp/tf_examples.part03.tfrecord,/tmp/tf_examples.part04.tfrecord,/tmp/tf_examples.part05.tfrecord,/tmp/tf_examples.part06.tfrecord,/tmp/tf_examples.part07.tfrecord,/tmp/tf_examples.part08.tfrecord \
+  --output_dir=/tmp/pretraining_output \
+  --do_train=True \
+  --do_eval=True \
+  --bert_config_file=$BERT_BASE_DIR/bert_config.json \
+  --init_checkpoint=$BERT_BASE_DIR/bert_model.ckpt \
+  --train_batch_size=32 \
+  --max_seq_length=128 \
+  --max_predictions_per_seq=20 \
+  --num_train_steps=20 \
+  --num_warmup_steps=10 \
+  --learning_rate=2e-5 \
+  --report_loss \
+  --use_fp16 \
+  --horovod
+```
 
 ### Pre-training tips and caveats
 
