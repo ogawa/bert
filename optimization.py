@@ -63,20 +63,61 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu, 
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
 
+  tvars = tf.trainable_variables()
   if use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
-  elif do_hvd:
-    import horovod.tensorflow as hvd
-    optimizer = hvd.DistributedOptimizer(optimizer)
+    grads = tf.gradients(loss, tvars)
+  else:
+    # multiply loss by scale to avoid vanishing gradient problems
+    # with mixed precision training
+    grads = tf.gradients(loss*128.0, tvars)
+    # convert IndexedSlices to tensors before allreduce calls
+    # and divide by scale
+    tensor_grads = []
+    for grad in grads:
+      if grad is not None:
+        if isinstance(grad, tf.IndexedSlices):
+          grad = tf.convert_to_tensor(grad)
+        tensor_grads.append(grad/128.0)
+      else:
+        tensor_grads.append(None)
+    grads = tensor_grads
 
-  tvars = tf.trainable_variables()
-  grads = tf.gradients(loss, tvars)
+    # do allreduce across all ranks if horovod is enabled
+    if do_hvd:
+      import horovod.tensorflow as hvd
+      from horovod.tensorflow.compression import Compression
+      if hvd.size() > 1:
+        averaged_gradients = []
+        with tf.name_scope("Horovod_Allreduce"):
+          for grad in grads:
+            if grad is not None:
+              avg_grad = hvd.allreduce(grad,
+                                       device_dense='',
+                                       device_sparse='',
+                                       compression=Compression.none)
+              averaged_gradients.append(avg_grad)
+            else:
+              averaged_gradients.append(None)
+        grads = averaged_gradients
+
+    # convert all gradients to fp32 so we can do clip_by_global_norm
+    # when we are doing mixed precision training
+    grads_fp32 = []
+    for grad in grads:
+      if grad is not None:
+        grads_fp32.append(tf.cast(grad, tf.float32))
+      else:
+        grads_fp32.append(None)
+    grads = grads_fp32
 
   # This is how the model was pre-trained.
   (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
+  grads_and_vars = zip(grads, tvars)
+  
   train_op = optimizer.apply_gradients(
-      zip(grads, tvars), global_step=global_step)
+      grads_and_vars, global_step=global_step)
 
   new_global_step = global_step + 1
   # name global_step so we can report it in training hook
@@ -114,6 +155,17 @@ class AdamWeightDecayOptimizer(tf.train.Optimizer):
         continue
 
       param_name = self._get_variable_name(param.name)
+      # create shadow weights for mixed precision variables
+      has_shadow = param.dtype.base_dtype != tf.float32
+      if has_shadow:
+        param_shadow = tf.get_variable(
+            name=param_name + "/shadow",
+            #shape=param.shape.as_list(),
+            dtype=tf.float32,
+            trainable=False,
+            initializer=tf.cast(param.initialized_value(),tf.float32))
+      else:
+        param_shadow = param
 
       m = tf.get_variable(
           name=param_name + "/adam_m",
@@ -145,16 +197,19 @@ class AdamWeightDecayOptimizer(tf.train.Optimizer):
       # with the m/v parameters. This is equivalent to adding the square
       # of the weights to the loss with plain (non-momentum) SGD.
       if self._do_use_weight_decay(param_name):
-        update += self.weight_decay_rate * param
+        update += self.weight_decay_rate * param_shadow
 
       update_with_lr = self.learning_rate * update
       # name learning rate so we can report it in training hook
       self.learning_rate = tf.identity(self.learning_rate, name='learning_rate')
 
-      next_param = param - update_with_lr
+      next_param = param_shadow - update_with_lr
 
+      if has_shadow:
+        # copy shadow weights to mixed precision variable
+        param.assign(tf.cast(next_param, param.dtype.base_dtype))
       assignments.extend(
-          [param.assign(next_param),
+          [param_shadow.assign(next_param),
            m.assign(next_m),
            v.assign(next_v)])
     return tf.group(*assignments, name=name)

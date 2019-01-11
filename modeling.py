@@ -134,7 +134,6 @@ class BertModel(object):
                token_type_ids=None,
                use_one_hot_embeddings=True,
                scope=None,
-	       custom_getter=None,
 	       compute_type=tf.float32):
     """Constructor for BertModel.
 
@@ -150,7 +149,6 @@ class BertModel(object):
         it is must faster if this is True, on the CPU or GPU, it is faster if
         this is False.
       scope: (optional) variable scope. Defaults to "bert".
-      custom_getter: (optional) custom_getter for compute types other than float32.
       compute_type: (optional) compute type for forward and back propagation.
 
     Raises:
@@ -172,7 +170,7 @@ class BertModel(object):
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
-    with tf.variable_scope(scope, default_name="bert", custom_getter=custom_getter):
+    with tf.variable_scope(scope, default_name="bert"):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
         (self.embedding_output, self.embedding_table) = embedding_lookup(
@@ -181,7 +179,8 @@ class BertModel(object):
             embedding_size=config.hidden_size,
             initializer_range=config.initializer_range,
             word_embedding_name="word_embeddings",
-            use_one_hot_embeddings=use_one_hot_embeddings)
+            use_one_hot_embeddings=use_one_hot_embeddings,
+            compute_type=tf.float32)
 
         # conditionally convert inputs to fp16
         self.embedding_output = tf.cast(self.embedding_output, compute_type)
@@ -199,7 +198,7 @@ class BertModel(object):
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
             dropout_prob=config.hidden_dropout_prob,
-	    compute_type=compute_type)
+	    compute_type=tf.float32)
 
       with tf.variable_scope("encoder"):
         # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
@@ -399,7 +398,8 @@ def embedding_lookup(input_ids,
                      embedding_size=128,
                      initializer_range=0.02,
                      word_embedding_name="word_embeddings",
-                     use_one_hot_embeddings=False):
+                     use_one_hot_embeddings=False,
+                     compute_type=tf.float32):
   """Looks up words embeddings for id tensor.
 
   Args:
@@ -426,12 +426,13 @@ def embedding_lookup(input_ids,
 
   embedding_table = tf.get_variable(
       name=word_embedding_name,
+      dtype=compute_type,
       shape=[vocab_size, embedding_size],
       initializer=create_initializer(initializer_range))
 
   if use_one_hot_embeddings:
     flat_input_ids = tf.reshape(input_ids, [-1])
-    one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
+    one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size, dtype=compute_type)
     output = tf.matmul(one_hot_input_ids, embedding_table)
   else:
     output = tf.nn.embedding_lookup(embedding_table, input_ids)
@@ -495,23 +496,24 @@ def embedding_postprocessor(input_tensor,
                        "`use_token_type` is True.")
     token_type_table = tf.get_variable(
         name=token_type_embedding_name,
+        dtype=compute_type,
         shape=[token_type_vocab_size, width],
         initializer=create_initializer(initializer_range))
     # This vocab will be small so we always do one-hot here, since it is always
     # faster for a small vocabulary.
     flat_token_type_ids = tf.reshape(token_type_ids, [-1])
-    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
+    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size, dtype=compute_type)
     token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
-    token_type_embeddings = tf.cast(token_type_embeddings, compute_type)
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
-    output += token_type_embeddings
+    output += tf.cast(token_type_embeddings, output.dtype)
 
   if use_position_embeddings:
     assert_op = tf.assert_less_equal(seq_length, max_position_embeddings)
     with tf.control_dependencies([assert_op]):
       full_position_embeddings = tf.get_variable(
           name=position_embedding_name,
+          dtype=compute_type,
           shape=[max_position_embeddings, width],
           initializer=create_initializer(initializer_range))
       # Since the position embedding table is a learned variable, we create it
@@ -534,10 +536,9 @@ def embedding_postprocessor(input_tensor,
       for _ in range(num_dims - 2):
         position_broadcast_shape.append(1)
       position_broadcast_shape.extend([seq_length, width])
-      position_embeddings = tf.cast(position_embeddings, compute_type)
       position_embeddings = tf.reshape(position_embeddings,
                                        position_broadcast_shape)
-      output += position_embeddings
+      output += tf.cast(position_embeddings, output.dtype)
 
   output = layer_norm_and_dropout(output, dropout_prob)
   return output

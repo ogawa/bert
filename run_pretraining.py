@@ -137,13 +137,8 @@ if FLAGS.horovod:
 
 if FLAGS.use_tpu:
   compute_type = tf.float32
-  custom_getter = None
 else:
-  try:
-    from gpu_environment import compute_type,custom_getter
-  except ImportError:
-    compute_type = tf.float32
-    custom_getter = None
+  compute_type = tf.float16 if FLAGS.use_fp16 else tf.float32
 
 # report samples/sec, total loss and learning rate during training
 class _LogSessionRunHook(tf.train.SessionRunHook):
@@ -202,7 +197,6 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         input_mask=input_mask,
         token_type_ids=segment_ids,
         use_one_hot_embeddings=use_one_hot_embeddings,
-        custom_getter=custom_getter,
 	compute_type=compute_type)
 
     (masked_lm_loss,
@@ -215,6 +209,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
          bert_config, model.get_pooled_output(), next_sentence_labels)
 
     total_loss = masked_lm_loss + next_sentence_loss
+    print('total_loss.dtype=',total_loss.dtype)
     # name total_loss so we can report it in training hook
     total_loss = tf.identity(total_loss, name='total_loss')
 
@@ -314,7 +309,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
 
-  with tf.variable_scope("cls/predictions", custom_getter=custom_getter):
+  with tf.variable_scope("cls/predictions"):
     # We apply one more non-linear transformation before the output layer.
     # This matrix is not used after pre-training.
     with tf.variable_scope("transform"):
@@ -332,7 +327,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
         "output_bias",
         shape=[bert_config.vocab_size],
         initializer=tf.zeros_initializer())
-    logits = tf.matmul(tf.cast(input_tensor,tf.float32), output_weights, transpose_b=True)
+    logits = tf.matmul(tf.cast(input_tensor, tf.float32), output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
 
@@ -340,7 +335,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     label_weights = tf.reshape(label_weights, [-1])
 
     one_hot_labels = tf.one_hot(
-        label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
+        label_ids, depth=bert_config.vocab_size)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -359,7 +354,7 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
 
   # Simple binary classification. Note that 0 is "next sentence" and 1 is
   # "random sentence". This weight matrix is not used after pre-training.
-  with tf.variable_scope("cls/seq_relationship", custom_getter=custom_getter):
+  with tf.variable_scope("cls/seq_relationship"):
     output_weights = tf.get_variable(
         "output_weights",
         shape=[2, bert_config.hidden_size],
@@ -367,11 +362,11 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
     output_bias = tf.get_variable(
         "output_bias", shape=[2], initializer=tf.zeros_initializer())
 
-    logits = tf.matmul(tf.cast(input_tensor,tf.float32), output_weights, transpose_b=True)
+    logits = tf.matmul(tf.cast(input_tensor, tf.float32), output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
-    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
+    one_hot_labels = tf.one_hot(labels, depth=2)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
